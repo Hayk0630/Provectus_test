@@ -151,10 +151,12 @@ pip install -r requirements.txt
 ### 2. Generate the synthetic dataset
 
 ```bash
-python generate_fake_data.py --num-users 100 --num-sessions 5000 --days 60 --seed 42 --output-dir .
+python generate_fake_data.py --num-users 100 --num-sessions 5000 --days 60 --seed 42
 ```
 
 Additional data-generation details are documented in `README_fake_data.md`.
+
+The pipeline auto-detects generated files in either the project root or `output/`.
 
 ### 3. Run the ETL pipeline
 

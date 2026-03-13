@@ -62,6 +62,51 @@ def _safe_parse_message(raw: object) -> dict | None:
         return None
 
 
+def _get_nested(data: dict, path: tuple[str, ...]) -> object:
+    current: object = data
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _extract_message_fields(message: dict) -> dict[str, object]:
+    attributes = message.get("attributes") if isinstance(message.get("attributes"), dict) else {}
+
+    def _attr_value(dotted_key: str, nested_path: tuple[str, ...] | None = None) -> object:
+        if dotted_key in attributes:
+            return attributes.get(dotted_key)
+        if nested_path:
+            return _get_nested(attributes, nested_path)
+        return None
+
+    return {
+        "body": _get_nested(message, ("body",)),
+        "event_name": _attr_value("event.name", ("event", "name")),
+        "session_id": _attr_value("session.id", ("session", "id")),
+        "user_email": _attr_value("user.email", ("user", "email")),
+        "organization_id": _attr_value("organization.id", ("organization", "id")),
+        "terminal_type": _attr_value("terminal.type", ("terminal", "type")),
+        "model": _attr_value("model"),
+        "input_tokens": _attr_value("input_tokens"),
+        "output_tokens": _attr_value("output_tokens"),
+        "cache_read_tokens": _attr_value("cache_read_tokens"),
+        "cache_creation_tokens": _attr_value("cache_creation_tokens"),
+        "cost_usd": _attr_value("cost_usd"),
+        "duration_ms": _attr_value("duration_ms"),
+        "tool_name": _attr_value("tool_name"),
+        "decision": _attr_value("decision"),
+        "decision_source": _attr_value("decision_source"),
+        "decision_type": _attr_value("decision_type"),
+        "success": _attr_value("success"),
+        "error": _attr_value("error"),
+        "status_code": _attr_value("status_code"),
+        "prompt_length": _attr_value("prompt_length"),
+        "attempt": _attr_value("attempt"),
+    }
+
+
 def build_events_table(batches: pd.DataFrame) -> pd.DataFrame:
     """Transform telemetry batches into one-row-per-event table.
 
@@ -89,21 +134,23 @@ def build_events_table(batches: pd.DataFrame) -> pd.DataFrame:
         return _empty_events_df()
 
     event_wrapper = pd.json_normalize(exploded["logEvents"])
-    parsed_messages = event_wrapper.get("message", pd.Series(dtype="object")).map(_safe_parse_message)
 
-    valid_mask = parsed_messages.notna()
-    if not bool(valid_mask.all()):
-        skipped = int((~valid_mask).sum())
+    message_values = event_wrapper.get("message", pd.Series(dtype="object"))
+    parsed_records: list[dict[str, object]] = []
+    skipped = 0
+
+    for raw_message in message_values.tolist():
+        parsed = _safe_parse_message(raw_message)
+        if parsed is None:
+            skipped += 1
+            parsed_records.append({})
+        else:
+            parsed_records.append(_extract_message_fields(parsed))
+
+    if skipped:
         print(f"[TRANSFORM] WARN: skipped {skipped} events with invalid JSON message payload")
 
-    event_wrapper = event_wrapper[valid_mask].reset_index(drop=True)
-    parsed_messages = parsed_messages[valid_mask].reset_index(drop=True)
-    exploded = exploded[valid_mask].reset_index(drop=True)
-
-    if event_wrapper.empty:
-        return _empty_events_df()
-
-    message = pd.json_normalize(parsed_messages)
+    parsed_df = pd.DataFrame(parsed_records)
 
     events = pd.DataFrame(
         {
@@ -112,28 +159,28 @@ def build_events_table(batches: pd.DataFrame) -> pd.DataFrame:
             "batch_year": pd.to_numeric(exploded["year"], errors="coerce"),
             "batch_month": pd.to_numeric(exploded["month"], errors="coerce"),
             "batch_day": pd.to_numeric(exploded["day"], errors="coerce"),
-            "body": message.get("body"),
-            "event_name": message.get("attributes.event.name"),
-            "session_id": message.get("attributes.session.id"),
-            "user_email": message.get("attributes.user.email"),
-            "organization_id": message.get("attributes.organization.id"),
-            "terminal_type": message.get("attributes.terminal.type"),
-            "model": message.get("attributes.model"),
-            "input_tokens": pd.to_numeric(message.get("attributes.input_tokens"), errors="coerce"),
-            "output_tokens": pd.to_numeric(message.get("attributes.output_tokens"), errors="coerce"),
-            "cache_read_tokens": pd.to_numeric(message.get("attributes.cache_read_tokens"), errors="coerce"),
-            "cache_creation_tokens": pd.to_numeric(message.get("attributes.cache_creation_tokens"), errors="coerce"),
-            "cost_usd": pd.to_numeric(message.get("attributes.cost_usd"), errors="coerce"),
-            "duration_ms": pd.to_numeric(message.get("attributes.duration_ms"), errors="coerce"),
-            "tool_name": message.get("attributes.tool_name"),
-            "decision": message.get("attributes.decision"),
-            "decision_source": message.get("attributes.decision_source"),
-            "decision_type": message.get("attributes.decision_type"),
-            "success": message.get("attributes.success"),
-            "error": message.get("attributes.error"),
-            "status_code": message.get("attributes.status_code"),
-            "prompt_length": pd.to_numeric(message.get("attributes.prompt_length"), errors="coerce"),
-            "attempt": pd.to_numeric(message.get("attributes.attempt"), errors="coerce"),
+            "body": parsed_df.get("body"),
+            "event_name": parsed_df.get("event_name"),
+            "session_id": parsed_df.get("session_id"),
+            "user_email": parsed_df.get("user_email"),
+            "organization_id": parsed_df.get("organization_id"),
+            "terminal_type": parsed_df.get("terminal_type"),
+            "model": parsed_df.get("model"),
+            "input_tokens": pd.to_numeric(parsed_df.get("input_tokens"), errors="coerce"),
+            "output_tokens": pd.to_numeric(parsed_df.get("output_tokens"), errors="coerce"),
+            "cache_read_tokens": pd.to_numeric(parsed_df.get("cache_read_tokens"), errors="coerce"),
+            "cache_creation_tokens": pd.to_numeric(parsed_df.get("cache_creation_tokens"), errors="coerce"),
+            "cost_usd": pd.to_numeric(parsed_df.get("cost_usd"), errors="coerce"),
+            "duration_ms": pd.to_numeric(parsed_df.get("duration_ms"), errors="coerce"),
+            "tool_name": parsed_df.get("tool_name"),
+            "decision": parsed_df.get("decision"),
+            "decision_source": parsed_df.get("decision_source"),
+            "decision_type": parsed_df.get("decision_type"),
+            "success": parsed_df.get("success"),
+            "error": parsed_df.get("error"),
+            "status_code": parsed_df.get("status_code"),
+            "prompt_length": pd.to_numeric(parsed_df.get("prompt_length"), errors="coerce"),
+            "attempt": pd.to_numeric(parsed_df.get("attempt"), errors="coerce"),
         }
     )
 
