@@ -25,6 +25,29 @@ def _api_requests(events: pd.DataFrame) -> pd.DataFrame:
     return api
 
 
+def _coerce_bool(value: object) -> bool | pd._libs.missing.NAType:
+    """Parse mixed boolean encodings from SQLite/text payloads."""
+
+    if pd.isna(value):
+        return pd.NA
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+
+    text = str(value).strip().lower()
+    if text in {"true", "1", "t", "yes", "y"}:
+        return True
+    if text in {"false", "0", "f", "no", "n"}:
+        return False
+    return pd.NA
+
+
 def level_cost_stats(events: pd.DataFrame, employees: pd.DataFrame) -> pd.DataFrame:
     """Compute API request cost metrics grouped by employee level.
 
@@ -202,9 +225,7 @@ def tool_usage_summary(events: pd.DataFrame) -> pd.DataFrame:
     ].copy()
 
     if not results.empty:
-        success_as_bool = results["success"].map(
-            lambda v: True if str(v).lower() == "true" else (False if str(v).lower() == "false" else pd.NA)
-        )
+        success_as_bool = results["success"].map(_coerce_bool)
         results["success_bool"] = success_as_bool
         results["duration_ms"] = pd.to_numeric(results["duration_ms"], errors="coerce")
     else:

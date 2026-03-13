@@ -31,6 +31,7 @@ from src.analytics import (
     tool_usage_summary,
 )
 from src.config import load_settings
+from src.ml import detect_session_anomalies, forecast_daily_cost
 from src.plots import build_cost_by_level_chart, build_event_mix_chart, build_hourly_usage_chart
 from src.storage import query_df
 
@@ -44,10 +45,14 @@ st.caption(f"Database: {settings.sqlite_path}")
 
 
 @st.cache_data(show_spinner=False)
-def load_tables(db_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_tables(db_path: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     events = query_df(db_path, "SELECT * FROM fact_events")
     employees = query_df(db_path, "SELECT * FROM dim_employees")
-    return events, employees
+    try:
+        sessions = query_df(db_path, "SELECT * FROM fact_sessions")
+    except Exception:
+        sessions = pd.DataFrame()
+    return events, employees, sessions
 
 
 def apply_filters(events: pd.DataFrame, employees: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
@@ -117,7 +122,7 @@ if not Path(settings.sqlite_path).exists():
     st.stop()
 
 try:
-    events_df, employees_df = load_tables(str(settings.sqlite_path))
+    events_df, employees_df, sessions_df = load_tables(str(settings.sqlite_path))
 except Exception as exc:
     st.error(f"Failed to load data from SQLite: {exc}")
     st.stop()
@@ -155,6 +160,23 @@ if selected_model:
 
 if selected_tool:
     tool_summary_df = tool_summary_df[tool_summary_df["tool_name"].isin(selected_tool)]
+
+# ML controls
+st.sidebar.header("ML")
+contamination = st.sidebar.slider(
+    "Anomaly contamination",
+    min_value=0.01,
+    max_value=0.20,
+    value=0.05,
+    step=0.01,
+)
+forecast_horizon = st.sidebar.slider(
+    "Forecast horizon (days)",
+    min_value=7,
+    max_value=60,
+    value=30,
+    step=1,
+)
 
 st.subheader("Cost by Seniority Level")
 st.plotly_chart(build_cost_by_level_chart(cost_by_level_df), width="stretch")
@@ -224,3 +246,79 @@ r1, r2, r3 = st.columns(3)
 r1.metric("Total API errors", f"{int(retry['total_api_errors']):,}")
 r2.metric("Retries after error", f"{int(retry['retries_after_error']):,}")
 r3.metric("Retry rate", f"{retry['retry_rate_pct']:.2f}%")
+
+st.subheader("ML: Session Cost Spike Anomaly Detection")
+if sessions_df.empty:
+    st.info("Session table is not available. Re-run pipeline to populate fact_sessions.")
+else:
+    sessions_for_scope = sessions_df[sessions_df["session_id"].isin(filtered_events["session_id"].dropna().unique())]
+    anomalies = detect_session_anomalies(sessions_for_scope, contamination=contamination)
+
+    a1, a2 = st.columns(2)
+    a1.metric("Sessions analyzed", f"{len(anomalies):,}")
+    a2.metric("Anomalies flagged", f"{int(anomalies['is_anomaly'].sum()):,}")
+
+    pca_fig = px.scatter(
+        anomalies,
+        x="pc1",
+        y="pc2",
+        color="is_anomaly",
+        size="total_cost_usd",
+        hover_data=["session_id", "user_email", "total_cost_usd", "api_request_count", "error_count"],
+        title="PCA Projection of Session Behavior (Anomalies Highlighted)",
+    )
+    st.plotly_chart(pca_fig, width="stretch")
+
+    st.markdown("Top anomalous sessions by score")
+    st.dataframe(
+        anomalies[[
+            "session_id",
+            "user_email",
+            "total_cost_usd",
+            "api_request_count",
+            "duration_seconds",
+            "error_count",
+            "anomaly_score",
+        ]].sort_values("anomaly_score", ascending=True).head(30),
+        width="stretch",
+    )
+
+st.subheader("ML: Daily Total API Cost Forecast")
+history_df, forecast_df, forecast_metrics = forecast_daily_cost(filtered_events, horizon_days=forecast_horizon)
+
+if history_df.empty:
+    st.info("No API request cost history for selected filters.")
+else:
+    hist_plot = history_df.rename(columns={"daily_total_cost_usd": "value"}).copy()
+    hist_plot["series"] = "historical"
+    fc_plot = forecast_df.rename(columns={"predicted_daily_total_cost_usd": "value"}).copy()
+    fc_plot["series"] = "forecast"
+    chart_df = pd.concat([hist_plot[["date", "value", "series"]], fc_plot[["date", "value", "series"]]], axis=0)
+
+    forecast_fig = px.line(
+        chart_df,
+        x="date",
+        y="value",
+        color="series",
+        markers=True,
+        title="Daily Total API Cost: Historical and Forecast",
+    )
+    st.plotly_chart(forecast_fig, width="stretch")
+
+    if forecast_metrics:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Forecast model", str(forecast_metrics.get("model", "n/a")))
+        if "rmse" in forecast_metrics:
+            m2.metric("Holdout RMSE", f"{forecast_metrics['rmse']:.4f}")
+        if pd.notna(forecast_metrics.get("r2")):
+            m3.metric("Holdout R²", f"{forecast_metrics['r2']:.4f}")
+
+        with st.expander("Forecast model comparison (lower RMSE is better)"):
+            comparison_rows = [
+                ("seasonal_naive_7", forecast_metrics.get("rmse_seasonal_naive_7")),
+                ("moving_average_7", forecast_metrics.get("rmse_moving_average_7")),
+                ("linear_regression_lag_features", forecast_metrics.get("rmse_linear_regression_lag_features")),
+            ]
+            comparison_df = pd.DataFrame(comparison_rows, columns=["model", "holdout_rmse"])
+            comparison_df = comparison_df.dropna(subset=["holdout_rmse"]).sort_values("holdout_rmse")
+            st.dataframe(comparison_df, width="stretch")
