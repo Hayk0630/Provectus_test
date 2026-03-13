@@ -1,0 +1,16 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local outputs
+analytics.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
