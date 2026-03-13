@@ -16,7 +16,7 @@ import pandas as pd
 
 def _api_requests(events: pd.DataFrame) -> pd.DataFrame:
     api = events.loc[events["event_name"] == "api_request"].copy()
-    api["timestamp"] = pd.to_datetime(api["timestamp"], utc=True, errors="coerce")
+    api["timestamp"] = pd.to_datetime(api["timestamp"], utc=True, errors="coerce", format="mixed")
     api["cost_usd"] = pd.to_numeric(api.get("cost_usd"), errors="coerce")
     api["input_tokens"] = pd.to_numeric(api.get("input_tokens"), errors="coerce")
     api["output_tokens"] = pd.to_numeric(api.get("output_tokens"), errors="coerce")
@@ -87,7 +87,7 @@ def peak_usage_by_hour(events: pd.DataFrame) -> pd.DataFrame:
     """
 
     hourly = events.copy()
-    hourly["timestamp"] = pd.to_datetime(hourly["timestamp"], utc=True, errors="coerce")
+    hourly["timestamp"] = pd.to_datetime(hourly["timestamp"], utc=True, errors="coerce", format="mixed")
     hourly = hourly.dropna(subset=["timestamp"])
     hourly["hour"] = hourly["timestamp"].dt.hour
 
@@ -133,16 +133,21 @@ def token_trends_by_segment(
         freq: pandas time frequency for bucketing timestamps.
     """
 
-    if segment not in employees.columns:
-        raise ValueError(f"Unknown segment column: {segment}")
-
     api = _api_requests(events)
-    joined = api.merge(
-        employees[["email", segment]],
-        left_on="user_email",
-        right_on="email",
-        how="left",
-    )
+
+    # If events are already enriched with employee metadata, avoid duplicate merge suffixes.
+    if segment in api.columns:
+        joined = api.copy()
+    else:
+        if segment not in employees.columns:
+            raise ValueError(f"Unknown segment column: {segment}")
+        joined = api.merge(
+            employees[["email", segment]],
+            left_on="user_email",
+            right_on="email",
+            how="left",
+        )
+
     joined["period"] = joined["timestamp"].dt.floor(freq)
 
     result = (
@@ -227,12 +232,16 @@ def tool_usage_summary(events: pd.DataFrame) -> pd.DataFrame:
     )
 
     merged = dec_agg.merge(res_agg, on="tool_name", how="outer").fillna(0)
-    merged["accept_rate_pct"] = (
-        merged["accept_count"] / merged["decision_events"].replace(0, pd.NA) * 100
-    ).fillna(0)
-    merged["success_rate_pct"] = (
-        merged["success_count"] / merged["result_events"].replace(0, pd.NA) * 100
-    ).fillna(0)
+    merged["decision_events"] = pd.to_numeric(merged["decision_events"], errors="coerce").fillna(0)
+    merged["result_events"] = pd.to_numeric(merged["result_events"], errors="coerce").fillna(0)
+    merged["accept_count"] = pd.to_numeric(merged["accept_count"], errors="coerce").fillna(0)
+    merged["success_count"] = pd.to_numeric(merged["success_count"], errors="coerce").fillna(0)
+
+    accept_denom = merged["decision_events"].where(merged["decision_events"] != 0, pd.NA)
+    success_denom = merged["result_events"].where(merged["result_events"] != 0, pd.NA)
+
+    merged["accept_rate_pct"] = (merged["accept_count"] / accept_denom * 100).fillna(0)
+    merged["success_rate_pct"] = (merged["success_count"] / success_denom * 100).fillna(0)
 
     return merged.sort_values("decision_events", ascending=False)
 
