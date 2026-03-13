@@ -11,6 +11,14 @@ venv/
 
 # Local outputs
 analytics.db
+employees.csv
+telemetry_logs.jsonl
+
+# Assignment and presentation source artifacts not needed in repo
+TechnicalAssignmentforInternshipProgram (2).pdf
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+# Exploratory notebooks
+experiments.ipynb
