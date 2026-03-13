@@ -14,6 +14,17 @@ Acceptance criteria:
 import pandas as pd
 
 
+def _api_requests(events: pd.DataFrame) -> pd.DataFrame:
+    api = events.loc[events["event_name"] == "api_request"].copy()
+    api["timestamp"] = pd.to_datetime(api["timestamp"], utc=True, errors="coerce")
+    api["cost_usd"] = pd.to_numeric(api.get("cost_usd"), errors="coerce")
+    api["input_tokens"] = pd.to_numeric(api.get("input_tokens"), errors="coerce")
+    api["output_tokens"] = pd.to_numeric(api.get("output_tokens"), errors="coerce")
+    api["cache_read_tokens"] = pd.to_numeric(api.get("cache_read_tokens"), errors="coerce")
+    api["duration_ms"] = pd.to_numeric(api.get("duration_ms"), errors="coerce")
+    return api
+
+
 def level_cost_stats(events: pd.DataFrame, employees: pd.DataFrame) -> pd.DataFrame:
     """Compute API request cost metrics grouped by employee level.
 
@@ -106,4 +117,156 @@ def overview_kpis(events: pd.DataFrame) -> dict[str, float]:
         "sessions": float(events["session_id"].nunique(dropna=True)),
         "api_request_count": float((events["event_name"] == "api_request").sum()),
         "total_api_cost_usd": float(api_cost),
+    }
+
+
+def token_trends_by_segment(
+    events: pd.DataFrame,
+    employees: pd.DataFrame,
+    segment: str = "practice",
+    freq: str = "D",
+) -> pd.DataFrame:
+    """Aggregate token/cost trends over time by employee segment.
+
+    Args:
+        segment: employees column to segment by (for example practice/level/location).
+        freq: pandas time frequency for bucketing timestamps.
+    """
+
+    if segment not in employees.columns:
+        raise ValueError(f"Unknown segment column: {segment}")
+
+    api = _api_requests(events)
+    joined = api.merge(
+        employees[["email", segment]],
+        left_on="user_email",
+        right_on="email",
+        how="left",
+    )
+    joined["period"] = joined["timestamp"].dt.floor(freq)
+
+    result = (
+        joined.groupby(["period", segment], dropna=False)
+        .agg(
+            api_request_count=("event_id", "count"),
+            total_input_tokens=("input_tokens", "sum"),
+            total_output_tokens=("output_tokens", "sum"),
+            total_cache_read_tokens=("cache_read_tokens", "sum"),
+            total_cost_usd=("cost_usd", "sum"),
+            active_users=("user_email", "nunique"),
+        )
+        .reset_index()
+        .sort_values(["period", segment])
+    )
+    return result
+
+
+def model_usage_summary(events: pd.DataFrame) -> pd.DataFrame:
+    """Summarize API usage and cost by model."""
+
+    api = _api_requests(events)
+    result = (
+        api.groupby("model", dropna=False)
+        .agg(
+            api_request_count=("event_id", "count"),
+            total_cost_usd=("cost_usd", "sum"),
+            avg_cost_usd=("cost_usd", "mean"),
+            avg_duration_ms=("duration_ms", "mean"),
+            total_input_tokens=("input_tokens", "sum"),
+            total_output_tokens=("output_tokens", "sum"),
+        )
+        .reset_index()
+        .sort_values("total_cost_usd", ascending=False)
+    )
+
+    total_reqs = result["api_request_count"].sum()
+    total_cost = result["total_cost_usd"].sum()
+    result["request_share_pct"] = (result["api_request_count"] / total_reqs * 100).fillna(0)
+    result["cost_share_pct"] = (result["total_cost_usd"] / total_cost * 100).fillna(0)
+    return result
+
+
+def tool_usage_summary(events: pd.DataFrame) -> pd.DataFrame:
+    """Summarize tool decisions and tool execution outcomes."""
+
+    decisions = events.loc[
+        events["event_name"] == "tool_decision", ["tool_name", "decision", "event_id"]
+    ].copy()
+    results = events.loc[
+        events["event_name"] == "tool_result", ["tool_name", "success", "duration_ms", "event_id"]
+    ].copy()
+
+    if not results.empty:
+        success_as_bool = results["success"].map(
+            lambda v: True if str(v).lower() == "true" else (False if str(v).lower() == "false" else pd.NA)
+        )
+        results["success_bool"] = success_as_bool
+        results["duration_ms"] = pd.to_numeric(results["duration_ms"], errors="coerce")
+    else:
+        results["success_bool"] = pd.Series(dtype="boolean")
+
+    dec_agg = (
+        decisions.groupby("tool_name", dropna=False)
+        .agg(
+            decision_events=("event_id", "count"),
+            accept_count=("decision", lambda s: int((s == "accept").sum())),
+            reject_count=("decision", lambda s: int((s == "reject").sum())),
+        )
+        .reset_index()
+    )
+
+    res_agg = (
+        results.groupby("tool_name", dropna=False)
+        .agg(
+            result_events=("event_id", "count"),
+            success_count=("success_bool", lambda s: int((s == True).sum())),
+            failure_count=("success_bool", lambda s: int((s == False).sum())),
+            avg_duration_ms=("duration_ms", "mean"),
+        )
+        .reset_index()
+    )
+
+    merged = dec_agg.merge(res_agg, on="tool_name", how="outer").fillna(0)
+    merged["accept_rate_pct"] = (
+        merged["accept_count"] / merged["decision_events"].replace(0, pd.NA) * 100
+    ).fillna(0)
+    merged["success_rate_pct"] = (
+        merged["success_count"] / merged["result_events"].replace(0, pd.NA) * 100
+    ).fillna(0)
+
+    return merged.sort_values("decision_events", ascending=False)
+
+
+def error_breakdown(events: pd.DataFrame) -> pd.DataFrame:
+    """Return grouped API error statistics by status/model/error text."""
+
+    errors = events.loc[events["event_name"] == "api_error"].copy()
+    if errors.empty:
+        return pd.DataFrame(columns=["status_code", "model", "error", "error_count"])
+
+    result = (
+        errors.groupby(["status_code", "model", "error"], dropna=False)
+        .size()
+        .reset_index(name="error_count")
+        .sort_values("error_count", ascending=False)
+    )
+    return result
+
+
+def retry_summary(events: pd.DataFrame) -> dict[str, float]:
+    """Estimate retry behavior using api_error -> api_request transitions in a session."""
+
+    ordered = events.sort_values(["session_id", "timestamp"]).copy()
+    ordered["next_event"] = ordered.groupby("session_id")["event_name"].shift(-1)
+
+    total_errors = float((ordered["event_name"] == "api_error").sum())
+    retries_after_error = float(
+        ((ordered["event_name"] == "api_error") & (ordered["next_event"] == "api_request")).sum()
+    )
+
+    retry_rate = (retries_after_error / total_errors * 100) if total_errors else 0.0
+    return {
+        "total_api_errors": total_errors,
+        "retries_after_error": retries_after_error,
+        "retry_rate_pct": retry_rate,
     }
